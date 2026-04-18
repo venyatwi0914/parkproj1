@@ -1,116 +1,95 @@
-import os
-import re
-import numpy as np
-import pandas as pd
-import joblib
+import os, re, numpy as np, pandas as pd, joblib, openai
 from flask import Flask, request, jsonify
-from flask_cors import CORS  
+from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app) 
+CORS(app)
 
+# --- CONFIGURATION ---
+K2_API_KEY = "your_k2_api_key_here"
+client = openai.OpenAI(api_key=K2_API_KEY, base_url="https://platform.moonshot.ai/v1")
 
-MODEL_PATH = 'pd_random_forest_model.pkl'
-SCALER_PATH = 'standard_scaler.pkl'
+MODEL_PATH, SCALER_PATH = 'pd_random_forest_model.pkl', 'standard_scaler.pkl'
+patient_data_store = {} # Temp store for session biomarkers
+
+# --- MEDICAL VAULT & RESEARCH ---
+PATIENT_VAULT = {
+    "Venya Tiwari": {
+        "history": "Age 18, Rutgers Undergraduate. No tremors reported. NJ resident.",
+        "risk_factors": "Low pesticide exposure; urban lifestyle."
+    },
+    "John Doe": {
+        "history": "Age 68, Retired farmer. Reports slight resting tremor in right hand.",
+        "risk_factors": "Historical exposure to agricultural pesticides (Paraquat)."
+    }
+}
+
+RESEARCH_INSIGHTS = """
+MIT-CS1PD Study: Hold Time (HT) Mean and CV (Coefficient of Variation) 
+are primary biomarkers. A significant difference (p=0.018) exists in HT Mean 
+between early PD and control groups. High HT variance indicates motor 
+control degradation.
+"""
 
 def load_model():
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
-        model = joblib.load(MODEL_PATH)
-        scaler = joblib.load(SCALER_PATH)
-        return model, scaler
+        return joblib.load(MODEL_PATH), joblib.load(SCALER_PATH)
     return None, None
 
 model, scaler = load_model()
 
-
+# --- PREPROCESSING ---
 def extract_live_features(events):
-    """
-    Processes raw keypress events from the front-end.
-    Filters: mouse clicks, modifiers (Shift/Alt/Ctrl), and backspaces.
-    """
-    # Regex patterns matching your research script
-    p_mouse = re.compile(r'mouse.+', re.IGNORECASE)
-    p_meta = re.compile(r'Shift|Alt|Control|Meta|Command', re.IGNORECASE)
-    p_back = re.compile(r'BackSpace', re.IGNORECASE)
-
-    cleaned_data = []
-    for ev in events:
-        key = str(ev.get('key', ''))
-        
-        # Apply the filters defined in your analysis
-        if p_mouse.match(key) or p_meta.match(key) or p_back.match(key):
-            continue
-            
-        ht = ev.get('hold_time', 0)
-        press = ev.get('press_time', 0)
-        
-        # Valid data range based on research constraints
-        if 0 <= ht < 5 and press > 0:
-            cleaned_data.append({'ht': ht, 'press': press})
-
-    if len(cleaned_data) < 10:
-        return None
-
-    df = pd.DataFrame(cleaned_data)
-    ht_vals = df['ht'].values
-    press_vals = df['press'].values
-    
-    # Calculate Flight Time (FT) - gap between consecutive presses
-    ft_vals = np.diff(press_vals)
-    ft_vals = ft_vals[(ft_vals > 0) & (ft_vals < 5)]
-
-    # Feature engineering prioritized by your Random Forest results
-    features = {
-        'ht_mean': np.mean(ht_vals),
-        'ht_std': np.std(ht_vals),
-        'ht_cv': np.std(ht_vals) / (np.mean(ht_vals) + 1e-9),
-        'ft_mean': np.mean(ft_vals) if len(ft_vals) > 0 else 0,
-        'ft_std': np.std(ft_vals) if len(ft_vals) > 0 else 0,
-        'typing_speed': len(ht_vals) / (press_vals[-1] - press_vals[0]) * 60 if len(press_vals) > 1 else 0
+    p_noise = re.compile(r'mouse.+|Shift|Alt|Control|Meta|Command|BackSpace', re.IGNORECASE)
+    cleaned = [ev for ev in events if not p_noise.match(str(ev.get('key', ''))) and 0 <= ev.get('hold_time', 0) < 5]
+    if len(cleaned) < 10: return None
+    df = pd.DataFrame(cleaned)
+    ht, press = df['hold_time'].values, df['press_time'].values
+    ft = np.diff(press)
+    ft = ft[(ft > 0) & (ft < 5)]
+    return {
+        'ht_mean': np.mean(ht), 'ht_std': np.std(ht), 'ht_cv': np.std(ht)/(np.mean(ht)+1e-9),
+        'ft_mean': np.mean(ft) if len(ft)>0 else 0, 'ft_std': np.std(ft) if len(ft)>0 else 0,
+        'typing_speed': len(ht)/(press[-1]-press[0])*60 if len(press)>1 else 0
     }
-    return features
 
-
+# --- ENDPOINTS ---
 @app.route('/predict', methods=['POST'])
 def predict():
     data = request.get_json()
-    if not data or 'events' not in data:
-        return jsonify({"error": "No events data provided"}), 400
-
+    name = data.get('patient_name', 'anonymous')
     features = extract_live_features(data['events'])
+    if not features: return jsonify({"error": "Insufficient data"}), 400
     
-    if features is None:
-        return jsonify({"error": "Insufficient valid keystrokes (min 10 required)"}), 400
-
-    
-    feature_vector = [
-        features['ht_mean'], 
-        features['ht_std'], 
-        features['ht_cv'], 
-        features['ft_mean'], 
-        features['ft_std'], 
-        features['typing_speed']
-    ]
-
-    response = {
-        "features": features,
-        "prediction_available": False,
-        "message": "Features extracted successfully."
-    }
-
+    res = {"features": features, "probability": 0.0}
     if model and scaler:
-        scaled_features = scaler.transform([feature_vector])
-        probability = model.predict_proba(scaled_features)[0][1]
-        response["probability"] = float(probability)
-        response["prediction_available"] = True
-        response["classification"] = "High Risk" if probability > 0.5 else "Low Risk"
+        vec = [features[f] for f in ['ht_mean', 'ht_std', 'ht_cv', 'ft_mean', 'ft_std', 'typing_speed']]
+        res["probability"] = float(model.predict_proba(scaler.transform([vec]))[0][1])
+    
+    patient_data_store[name] = res # Save for doctor search
+    return jsonify(res)
 
-    return jsonify(response)
+@app.route('/doctor/search', methods=['POST'])
+def search():
+    name = request.json.get('name')
+    if name in PATIENT_VAULT and name in patient_data_store:
+        return jsonify({"history": PATIENT_VAULT[name], "biometrics": patient_data_store[name]})
+    return jsonify({"error": "Patient not found"}), 404
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "healthy", "model_loaded": model is not None})
+@app.route('/doctor/chat', methods=['POST'])
+def chat():
+    data = request.json
+    name, question = data.get('name'), data.get('question')
+    ctx = f"Patient: {name}\nHistory: {PATIENT_VAULT[name]}\nBiometrics: {patient_data_store[name]}\n\nResearch: {RESEARCH_INSIGHTS}"
+    
+    response = client.chat.completions.create(
+        model="kimi-k2-thinking",
+        messages=[
+            {"role": "system", "content": "You are a clinical assistant. Use the research and data provided to reason step-by-step."},
+            {"role": "user", "content": f"{ctx}\n\nQuestion: {question}"}
+        ]
+    )
+    return jsonify({"reply": response.choices[0].message.content})
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
